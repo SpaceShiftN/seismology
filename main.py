@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from obspy import read
 from obspy.signal.trigger import classic_sta_lta, trigger_onset
+from scipy import signal
 from datetime import timedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
@@ -56,7 +57,7 @@ if features:
     features_scaled = scaler.fit_transform(features)
 
     # Train One-Class SVM to identify significant events
-    svm = OneClassSVM(nu=0.1, kernel='rbf', gamma='scale')
+    svm = OneClassSVM(nu=0.05, kernel='rbf', gamma='scale')
     svm.fit(features_scaled)
     labels = svm.predict(features_scaled)
 
@@ -71,25 +72,32 @@ if features:
             significant_events.append((event_start, event_end, duration, amplitude))
 
     # Plot the results
-    plt.figure(figsize=(12, 8))
-    plt.subplot(3, 1, 1)
-    plt.plot(tr.times(), tr.data, 'k')
-    plt.title('Original Seismic Signal')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Amplitude')
+    fig, axs = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
+    
+    # Original Seismic Signal
+    axs[0].plot(tr.times(), tr.data, 'k')
+    axs[0].set_title('Original Seismic Signal')
+    axs[0].set_ylabel('Amplitude')
 
-    plt.subplot(3, 1, 2)
-    plt.plot(tr_filtered.times(), tr_filtered.data, 'b')
-    plt.title('Filtered Seismic Signal (Bandpass)')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Amplitude')
+    # Filtered Seismic Signal
+    axs[1].plot(tr_filtered.times(), tr_filtered.data, 'b')
+    axs[1].set_title('Filtered Seismic Signal (Bandpass)')
+    axs[1].set_ylabel('Amplitude')
 
-    plt.subplot(3, 1, 3)
-    plt.plot(tr.times(), cft, 'b')
-    plt.hlines([threshold_on, threshold_off], tr.times()[0], tr.times()[-1], colors=['r', 'g'], linestyles='--')
-    plt.title('STA/LTA Characteristic Function')
-    plt.xlabel('Time (s)')
-    plt.ylabel('STA/LTA Ratio')
+    # STA/LTA Characteristic Function
+    axs[2].plot(tr.times(), cft, 'b')
+    axs[2].hlines([threshold_on, threshold_off], tr.times()[0], tr.times()[-1], colors=['r', 'g'], linestyles='--')
+    axs[2].set_title('STA/LTA Characteristic Function')
+    axs[2].set_ylabel('STA/LTA Ratio')
+
+    # Spectrogram
+    f, t, Sxx = signal.spectrogram(tr_filtered.data, tr_filtered.stats.sampling_rate, nperseg=256, noverlap=128)
+    im = axs[3].pcolormesh(t, f, 10 * np.log10(Sxx), shading='gouraud', cmap='jet')
+    axs[3].set_title('Spectrogram of Filtered Seismic Signal')
+    axs[3].set_xlabel('Time (s)')
+    axs[3].set_ylabel('Frequency (Hz)')
+    cbar = plt.colorbar(im, ax=axs[3], orientation='vertical')
+    cbar.set_label('Power (dB)')
 
     plt.tight_layout()
     plt.show()
