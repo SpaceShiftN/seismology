@@ -8,9 +8,11 @@ from datetime import timedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 import os
+from pathlib import Path
 
 # Load seismic data from mseed file
-mseed_file = 'D:/SpaceShift/XB.ELYSE.02.BHV.2022-01-02HR04_evid0006.mseed'
+script_dir = Path(__file__).parent
+mseed_file = script_dir / 'XB.ELYSE.02.BHV.2022-01-02HR04_evid0006.mseed'
 if not os.path.exists(mseed_file):
     raise FileNotFoundError(f"File not found: {mseed_file}")
 
