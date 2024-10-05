@@ -103,7 +103,45 @@ if features:
 
     plt.tight_layout()
     plt.show()
+    
+    # Load previous anomalies if they exist
+    historical_anomalies_file = 'D:/SpaceShift/historical_anomalies.csv'
+    if os.path.exists(historical_anomalies_file):
+        historical_df = pd.read_csv(historical_anomalies_file)
+    else:
+        historical_df = pd.DataFrame(columns=['duration', 'amplitude', 'energy'])
 
+    # Convert the features to DataFrame for better manipulation
+    new_anomalies_df = pd.DataFrame(features, columns=['duration', 'amplitude', 'energy'])
+
+    # Scale the new and historical anomalies (if historical data exists)
+    scaler = StandardScaler()
+    if not historical_df.empty:
+        combined_df = pd.concat([historical_df[['duration', 'amplitude', 'energy']], new_anomalies_df])
+        combined_scaled = scaler.fit_transform(combined_df)
+        historical_scaled = combined_scaled[:len(historical_df)]
+        new_anomalies_scaled = combined_scaled[len(historical_df):]
+    else:
+        new_anomalies_scaled = scaler.fit_transform(new_anomalies_df)
+
+    # Compare new anomalies with historical anomalies to find the most similar ones
+    similarities = []
+    if not historical_df.empty:
+        distances = pairwise_distances(new_anomalies_scaled, historical_scaled, metric='euclidean')
+        for i, distance in enumerate(distances):
+            most_similar_idx = np.argmin(distance)
+            most_similar_distance = np.min(distance)
+            similarities.append((i, most_similar_idx, most_similar_distance))
+
+    # Save new anomalies to historical data
+    new_anomalies_df['filename'] = os.path.basename(mseed_file)
+    new_anomalies_df.to_csv(historical_anomalies_file, mode='a', header=False, index=False)
+
+    # Print similarities
+    for similarity in similarities:
+        new_idx, hist_idx, dist = similarity
+        print(f"New anomaly {new_idx} is most similar to historical anomaly {hist_idx} with distance {dist:.2f}")
+        
     # Print the significant events
     detections = []
     for event in significant_events:
