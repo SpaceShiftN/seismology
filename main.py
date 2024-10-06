@@ -36,6 +36,23 @@ maxfreq = 0.5
 tr_filtered = tr.copy()
 tr_filtered.filter('bandpass', freqmin=minfreq, freqmax=maxfreq)
 
+# Butterworth filter
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = filtfilt(b, a, data)
+    return y
+
+# Use of Butterworth filter
+tr_filtered = tr.copy()
+tr_filtered.data = butter_bandpass_filter(tr_filtered.data, minfreq, maxfreq, sampling_rate)
+
 # Apply the STA/LTA algorithm
 cft = classic_sta_lta(tr_filtered.data, sta_samples, lta_samples)
 
