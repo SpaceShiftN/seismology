@@ -15,12 +15,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-# Load seismic data from mseed file
+# Set the file paths
 script_dir = Path(__file__).parent
 mseed_file = script_dir / 'XB.ELYSE.02.BHV.2022-01-02HR04_evid0006.mseed'
+
 if not os.path.exists(mseed_file):
     raise FileNotFoundError(f"File not found: {mseed_file}")
 
+# Load the seismic data
 st = read(mseed_file)
 tr = st[0]  # Take the first trace
 
@@ -38,10 +40,8 @@ lta_samples = int(lta_window * sampling_rate)
 # Filter the trace to bring out particular frequencies (bandpass filter)
 minfreq = 0.01
 maxfreq = 0.5
-tr_filtered = tr.copy()
-tr_filtered.filter('bandpass', freqmin=minfreq, freqmax=maxfreq)
 
-# Butterworth filter
+# Butterworth filter functions
 def butter_bandpass(lowcut, highcut, fs, order=4):
     nyq = 0.5 * fs
     low = lowcut / nyq
@@ -54,7 +54,7 @@ def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
     y = filtfilt(b, a, data)
     return y
 
-# Use of Butterworth filter
+# Apply Butterworth filter
 tr_filtered = tr.copy()
 tr_filtered.data = butter_bandpass_filter(tr_filtered.data, minfreq, maxfreq, sampling_rate)
 
@@ -64,12 +64,13 @@ cft = classic_sta_lta(tr_filtered.data, sta_samples, lta_samples)
 # Find the onset and end times of events
 onsets = trigger_onset(cft, threshold_on, threshold_off)
 
-# Define a custom dataset class for CNN
+# Label the data based on detected events
 data = tr_filtered.data
 labels = np.zeros(len(data))
 for onset in onsets:
     labels[onset[0]:onset[1]] = 1  # Label events as 1
 
+# Define a custom dataset class for CNN
 class SeismicDataset(Dataset):
     def __init__(self, data, labels, window_size=512):
         self.data = data
@@ -118,53 +119,104 @@ class SeismicCNN(nn.Module):
         x = self.fc_layers(x)
         return x
 
-# Training the CNN model
+# Check if the model already exists
+model_path = script_dir / 'seismic_cnn.pth'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 model = SeismicCNN().to(device)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+if model_path.exists():
+    # Load the saved model
+    model.load_state_dict(torch.load(model_path))
+    print("Model loaded from disk.")
+else:
+    # Train the CNN model
+    print("Model not found. Starting training.")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-num_epochs = 20
-model.train()
-for epoch in range(num_epochs):
-    running_loss = 0.0
-    for inputs, labels in dataloader:
-        inputs = inputs.to(device)
-        labels = labels.to(device)
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item() * inputs.size(0)
-    epoch_loss = running_loss / len(dataloader.dataset)
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+    num_epochs = 20
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for inputs, labels_batch in dataloader:
+            inputs = inputs.to(device)
+            labels_batch = labels_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels_batch)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * inputs.size(0)
+        epoch_loss = running_loss / len(dataloader.dataset)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+
+    # Save the model
+    torch.save(model.state_dict(), model_path)
+    print("Model saved to disk.")
 
 # Inference
-event_times = []
+event_windows = []
 model.eval()
 with torch.no_grad():
-    for i in range(len(dataset)):
-        input_data, _ = dataset[i]
+    for idx in range(len(dataset)):
+        input_data, _ = dataset[idx]
         input_data = input_data.to(device)
         input_data = input_data.unsqueeze(0)  # Add batch dimension
         output = model(input_data)
         _, predicted = torch.max(output.data, 1)
         if predicted.item() == 1:
-            event_times.append(tr.stats.starttime + timedelta(seconds=(i * tr.stats.delta)))
+            # Convert window index to sample index
+            sample_idx = idx
+            event_windows.append(sample_idx)
 
-# Print detected events
-for event_time in event_times:
-    print(f"Detected event at {event_time}")
+# Post-process the detected event windows to merge contiguous windows
+def merge_event_windows(event_windows, window_size):
+    if not event_windows:
+        return []
+    events = []
+    current_event = [event_windows[0], event_windows[0] + window_size]
+    for idx in event_windows[1:]:
+        if idx <= current_event[1]:
+            # Extend the current event
+            current_event[1] = idx + window_size
+        else:
+            # Save the current event and start a new one
+            events.append(current_event)
+            current_event = [idx, idx + window_size]
+    events.append(current_event)
+    return events
 
-# Save the model
-torch.save(model.state_dict(), 'seismic_cnn.pth')
+merged_events = merge_event_windows(event_windows, window_size)
 
-# Load the model
-model = SeismicCNN()
-model.load_state_dict(torch.load('seismic_cnn.pth'))
-model.to(device)
+# Collect event information and save to CSV
+detections = []
+for event in merged_events:
+    event_start_idx = event[0]
+    event_end_idx = event[1]
+    event_start_time = tr.stats.starttime + event_start_idx * tr.stats.delta
+    event_end_time = tr.stats.starttime + event_end_idx * tr.stats.delta
+    duration = event_end_time - event_start_time  # Removed .total_seconds()
+    amplitude = np.max(np.abs(tr_filtered.data[event_start_idx:event_end_idx]))
+    detection = {
+        'filename': mseed_file.name,
+        'start_time': event_start_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
+        'end_time': event_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
+        'duration': duration,  # Now duration is in seconds
+        'amplitude': amplitude
+    }
+    detections.append(detection)
+
+# Save detections to CSV
+output_csv = script_dir / 'detected_events.csv'
+detections_df = pd.DataFrame(detections)
+detections_df.to_csv(output_csv, index=False)
+print(f"Detections saved to {output_csv}")
+
+# Optional: Print the detections
+for detection in detections:
+    print(f"Detected event from {detection['start_time']} to {detection['end_time']}, "
+          f"Duration: {detection['duration']:.2f}s, Amplitude: {detection['amplitude']:.2e}")
 
 # Plot the results
 fig, axs = plt.subplots(4, 1, figsize=(14, 16), sharex=True)
@@ -193,6 +245,14 @@ axs[3].set_xlabel('Time (s)')
 axs[3].set_ylabel('Frequency (Hz)')
 cbar = plt.colorbar(im, ax=axs[3], orientation='vertical')
 cbar.set_label('Power (dB)')
+
+# Mark detected events on the plots
+for event in merged_events:
+    event_start_time = tr.stats.starttime + event[0] * tr.stats.delta
+    event_end_time = tr.stats.starttime + event[1] * tr.stats.delta
+    axs[0].axvspan(event_start_time - tr.stats.starttime, event_end_time - tr.stats.starttime, color='red', alpha=0.3)
+    axs[1].axvspan(event_start_time - tr.stats.starttime, event_end_time - tr.stats.starttime, color='red', alpha=0.3)
+    axs[2].axvspan(event_start_time - tr.stats.starttime, event_end_time - tr.stats.starttime, color='red', alpha=0.3)
 
 plt.tight_layout()
 plt.show()
