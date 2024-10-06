@@ -9,6 +9,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 import os
 from pathlib import Path
+from scipy.signal import butter, filtfilt
+from sklearn.metrics.pairwise import pairwise_distances
 
 # Load seismic data from mseed file
 script_dir = Path(__file__).parent
