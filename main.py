@@ -15,24 +15,29 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from collections import Counter
 import warnings
+import time
 
 # Подавляем предупреждения
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Определение класса набора данных
+# Определение класса набора данных с параметром step
 class SeismicDataset(Dataset):
-    def __init__(self, data_info_list, window_size=512):
+    def __init__(self, data_info_list, window_size=512, step=256):
         self.data_info_list = data_info_list
         self.window_size = window_size
+        self.step = step
         self.indices = []
         for idx, info in enumerate(self.data_info_list):
             data_length = len(info['data']) - window_size
-            for i in range(data_length):
+            if data_length <= 0:
+                print(f"Предупреждение: data_length <= 0 для файла {info['filename']}")
+                continue
+            for i in range(0, data_length, self.step):
                 self.indices.append((idx, i))
-    
+
     def __len__(self):
         return len(self.indices)
-    
+
     def __getitem__(self, idx):
         data_idx, offset = self.indices[idx]
         info = self.data_info_list[data_idx]
@@ -64,7 +69,7 @@ class SeismicCNN(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 2)
         )
-    
+
     def forward(self, x):
         x = x.unsqueeze(1)  # Добавляем размер канала
         x = self.conv_layers(x)
@@ -112,8 +117,8 @@ def merge_event_windows(event_windows, window_size):
     events.append(current_event)
     return events
 
-# Функция для загрузки данных с дополнительными выводами
-def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=None):
+# Функция для загрузки данных с возможностью ограничения количества файлов
+def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=None, max_files=None):
     data_info_list = []
     sampling_rates = []
 
@@ -131,6 +136,11 @@ def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=Non
     if len(mseed_files) == 0:
         print("Ошибка: Не найдено файлов с расширением .mseed")
         sys.exit(1)
+
+    # Ограничиваем количество файлов, если указано
+    if max_files is not None:
+        mseed_files = mseed_files[:max_files]
+        print(f"Используются первые {max_files} файлов для обучения.")
 
     # Сбор частот дискретизации
     for mseed_file in mseed_files:
@@ -194,7 +204,8 @@ def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=Non
         data_info_list.append(data_info)
     print("Загрузка и предобработка данных завершены.")
 
-    dataset = SeismicDataset(data_info_list, window_size)
+    dataset = SeismicDataset(data_info_list, window_size, step=512)  # Вы можете изменить step для уменьшения выборок
+    print(f"Размер датасета: {len(dataset)} выборок")
     return dataset, target_sampling_rate
 
 # Основная функция
@@ -213,6 +224,8 @@ def main():
     parser.add_argument('--target_sampling_rate', type=float, help='Целевая частота дискретизации для ресемплирования данных')
     parser.add_argument('--save_plots', action='store_true', help='Сохранять графики в файлы PNG')
     parser.add_argument('--plots_dir', type=str, default='plots', help='Директория для сохранения графиков')
+    parser.add_argument('--max_files', type=int, help='Максимальное количество файлов для обучения')
+    parser.add_argument('--step', type=int, default=256, help='Шаг для генерации выборок в датасете')
     args = parser.parse_args()
 
     # Проверка наличия нескольких GPU
@@ -235,9 +248,16 @@ def main():
 
     if args.mode == 'train':
         # Загружаем данные
-        dataset, sampling_rate = load_data(args.data, args.window_size, args.minfreq, args.maxfreq, args.target_sampling_rate)
+        dataset, sampling_rate = load_data(
+            args.data,
+            args.window_size,
+            args.minfreq,
+            args.maxfreq,
+            args.target_sampling_rate,
+            max_files=args.max_files
+        )
         # Устанавливаем num_workers в 0 или значение, соответствующее вашей системе
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
 
         # Обработка дисбаланса классов
         all_labels = [label for _, label in dataset]
@@ -256,6 +276,7 @@ def main():
         model.train()
         for epoch in range(args.epochs):
             running_loss = 0.0
+            start_time = time.time()
             for batch_idx, (inputs, labels_batch) in enumerate(dataloader):
                 inputs = inputs.to(device, non_blocking=True)
                 labels_batch = labels_batch.to(device, non_blocking=True)
@@ -268,7 +289,8 @@ def main():
                 if batch_idx % 10 == 0:
                     print(f"Эпоха [{epoch+1}/{args.epochs}], Батч [{batch_idx}/{len(dataloader)}], Потеря: {loss.item():.4f}")
             epoch_loss = running_loss / len(dataloader.dataset)
-            print(f"Эпоха [{epoch+1}/{args.epochs}] завершена, Средняя потеря: {epoch_loss:.4f}")
+            end_time = time.time()
+            print(f"Эпоха [{epoch+1}/{args.epochs}] завершена, Средняя потеря: {epoch_loss:.4f}, Время эпохи: {end_time - start_time:.2f} секунд")
 
         # Сохраняем модель
         if gpu_count > 1:
