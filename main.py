@@ -23,9 +23,9 @@ tr = st[0]  # Take the first trace
 
 # Parameters for STA/LTA algorithm
 sta_window = 5  # Short-term average window in seconds
-lta_window = 50  # Long-term average window in seconds
+lta_window = 60  # Long-term average window in seconds
 threshold_on = 2.5  # Trigger threshold for event detection
-threshold_off = 1.0  # Threshold for event ending
+threshold_off = 0.9  # Threshold for event ending
 
 # Convert the STA/LTA window to number of samples
 sampling_rate = tr.stats.sampling_rate
