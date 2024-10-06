@@ -67,6 +67,7 @@ class SeismicCNN(nn.Module):
         self.fc_layers = nn.Sequential(
             nn.Linear(fc_input_size, 128),
             nn.ReLU(),
+            nn.Dropout(p=0.5),  # Добавлен слой Dropout для регуляризации
             nn.Linear(128, 2)
         )
 
@@ -118,7 +119,7 @@ def merge_event_windows(event_windows, window_size):
     return events
 
 # Функция для загрузки данных с возможностью ограничения количества файлов
-def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=None, max_files=None):
+def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=None, max_files=None, step=256):
     data_info_list = []
     sampling_rates = []
 
@@ -204,7 +205,7 @@ def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=Non
         data_info_list.append(data_info)
     print("Загрузка и предобработка данных завершены.")
 
-    dataset = SeismicDataset(data_info_list, window_size, step=512)  # Вы можете изменить step для уменьшения выборок
+    dataset = SeismicDataset(data_info_list, window_size, step=step)
     print(f"Размер датасета: {len(dataset)} выборок")
     return dataset, target_sampling_rate
 
@@ -226,6 +227,7 @@ def main():
     parser.add_argument('--plots_dir', type=str, default='plots', help='Директория для сохранения графиков')
     parser.add_argument('--max_files', type=int, help='Максимальное количество файлов для обучения')
     parser.add_argument('--step', type=int, default=256, help='Шаг для генерации выборок в датасете')
+    parser.add_argument('--learning_rate', type=float, default=0.001, help='Скорость обучения')
     args = parser.parse_args()
 
     # Проверка наличия нескольких GPU
@@ -246,7 +248,19 @@ def main():
         model = nn.DataParallel(model)
     model.to(device)
 
-    if args.mode == 'train':
+    if args.mode == 'train' or args.mode == 'retrain':
+        if args.mode == 'retrain':
+            # Загрузка сохраненной модели
+            if not os.path.exists(args.model):
+                print("Ошибка: Файл модели не найден.")
+                sys.exit(1)
+            state_dict = torch.load(args.model)
+            if gpu_count > 1:
+                model.module.load_state_dict(state_dict)
+            else:
+                model.load_state_dict(state_dict)
+            print(f"Модель {args.model} загружена для дообучения.")
+
         # Загружаем данные
         dataset, sampling_rate = load_data(
             args.data,
@@ -254,7 +268,8 @@ def main():
             args.minfreq,
             args.maxfreq,
             args.target_sampling_rate,
-            max_files=args.max_files
+            max_files=args.max_files,
+            step=args.step
         )
         # Устанавливаем num_workers в 0 или значение, соответствующее вашей системе
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
@@ -270,7 +285,7 @@ def main():
 
         # Обучение модели
         criterion = nn.CrossEntropyLoss(weight=class_weights)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
         print("Начинается обучение модели...")
         model.train()
