@@ -3,93 +3,30 @@ import sys
 import argparse
 import numpy as np
 import pandas as pd
-from scipy import signal
 from obspy import read
 from obspy.signal.trigger import classic_sta_lta, trigger_onset
 from scipy.signal import butter, filtfilt
-from datetime import timedelta
+from scipy import signal
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from pathlib import Path
-import matplotlib.pyplot as plt
-from obspy import UTCDateTime
-from collections import Counter
-from torch.cuda.amp import GradScaler, autocast
 from sklearn.preprocessing import StandardScaler
+from pathlib import Path
+from collections import Counter
+import warnings
 
-import torch
-import torch.nn as nn
-
-class InceptionModule(nn.Module):
-    def __init__(self, in_channels, bottleneck_channels=32, kernel_sizes=[9, 19, 39], use_residual=True):
-        super(InceptionModule, self).__init__()
-        self.use_residual = use_residual
-
-        self.bottleneck = nn.Conv1d(in_channels, bottleneck_channels, kernel_size=1, bias=False) if in_channels > 1 else nn.Identity()
-
-        self.conv_layers = nn.ModuleList()
-        for ks in kernel_sizes:
-            padding = ks // 2
-            self.conv_layers.append(
-                nn.Conv1d(bottleneck_channels, 32, kernel_size=ks, padding=padding, bias=False)
-            )
-
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool1d(kernel_size=3, stride=1, padding=1),
-            nn.Conv1d(in_channels, 32, kernel_size=1, bias=False)
-        )
-
-        self.batch_norm = nn.BatchNorm1d(128)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        residual = x
-
-        x = self.bottleneck(x)
-
-        conv_outputs = [conv(x) for conv in self.conv_layers]
-        conv_outputs.append(self.maxpool_conv(residual))
-
-        x = torch.cat(conv_outputs, dim=1)
-        x = self.batch_norm(x)
-        x = self.relu(x)
-
-        if self.use_residual:
-            x += residual
-            x = self.relu(x)
-
-        return x
-
-class InceptionTime(nn.Module):
-    def __init__(self, num_blocks=6, in_channels=1, num_classes=2):
-        super(InceptionTime, self).__init__()
-        self.blocks = nn.ModuleList()
-        for i in range(num_blocks):
-            self.blocks.append(InceptionModule(in_channels if i == 0 else 128))
-        self.gap = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(128, num_classes)
-
-    def forward(self, x):
-        x = x.unsqueeze(1)  # Добавляем размер канала
-        for block in self.blocks:
-            x = block(x)
-        x = self.gap(x).squeeze(-1)
-        x = self.fc(x)
-        return x
-
+# Подавляем предупреждения
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Определение класса набора данных
 class SeismicDataset(Dataset):
     def __init__(self, data_info_list, window_size=512):
-        """
-        data_info_list: список словарей с ключами 'data', 'labels', 'filename'
-        """
         self.data_info_list = data_info_list
         self.window_size = window_size
         self.indices = []
         for idx, info in enumerate(self.data_info_list):
-            data_length = len(info['data']) - self.window_size
+            data_length = len(info['data']) - window_size
             for i in range(data_length):
                 self.indices.append((idx, i))
     
@@ -106,8 +43,7 @@ class SeismicDataset(Dataset):
         y = 1 if y.max() > 0 else 0
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
-
-# Определение модели
+# Определение модели SeismicCNN
 class SeismicCNN(nn.Module):
     def __init__(self, window_size=512):
         super(SeismicCNN, self).__init__()
@@ -161,7 +97,22 @@ def classic_sta_lta_labels(tr_filtered, sta_samples, lta_samples, threshold_on, 
         labels[onset[0]:onset[1]] = 1
     return labels
 
-# Функция для загрузки данных из файла или директории
+# Функция для объединения окон событий
+def merge_event_windows(event_windows, window_size):
+    if not event_windows:
+        return []
+    events = []
+    current_event = [event_windows[0], event_windows[0] + window_size]
+    for idx in event_windows[1:]:
+        if idx <= current_event[1]:
+            current_event[1] = idx + window_size
+        else:
+            events.append(current_event)
+            current_event = [idx, idx + window_size]
+    events.append(current_event)
+    return events
+
+# Функция для загрузки данных
 def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=None):
     data_info_list = []
     sampling_rates = []
@@ -191,7 +142,6 @@ def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=Non
         print(f"Используется заданная целевая частота дискретизации: {target_sampling_rate} Hz")
     
     data_info_list = []
-
     for mseed_file in mseed_files:
         st = read(mseed_file)
         tr = st[0]
@@ -204,6 +154,7 @@ def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=Non
         
         sampling_rate = tr.stats.sampling_rate
         
+        # Фильтрация сигнала
         tr_filtered = tr.copy()
         tr_filtered.data = butter_bandpass_filter(tr_filtered.data, minfreq, maxfreq, sampling_rate)
         
@@ -214,13 +165,13 @@ def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=Non
         lta_samples = int(lta_window * sampling_rate)
         threshold_on = 2.5
         threshold_off = 0.9
-
-        # Вычисление STA/LTA характеристической функции
-        cft = classic_sta_lta(tr_filtered.data, sta_samples, lta_samples)
         
+        # Получение меток событий
         labels = classic_sta_lta_labels(tr_filtered, sta_samples, lta_samples, threshold_on, threshold_off)
-        scaler = StandardScaler()
         data = tr_filtered.data
+        
+        # Нормализация данных
+        scaler = StandardScaler()
         data = scaler.fit_transform(data.reshape(-1, 1)).flatten()
         
         data_info = {
@@ -229,7 +180,7 @@ def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=Non
             'filename': mseed_file,
             'tr': tr,  # Сохраняем оригинальный трейс
             'tr_filtered': tr_filtered,  # Сохраняем отфильтрованный трейс
-            'cft': cft,  # Сохраняем STA/LTA характеристическую функцию
+            'cft': classic_sta_lta(tr_filtered.data, sta_samples, lta_samples),  # Сохраняем STA/LTA характеристическую функцию
             'sampling_rate': sampling_rate
         }
         
@@ -237,21 +188,6 @@ def load_data(data_path, window_size, minfreq, maxfreq, target_sampling_rate=Non
     
     dataset = SeismicDataset(data_info_list, window_size)
     return dataset, target_sampling_rate
-
-# Функция для объединения окон событий
-def merge_event_windows(event_windows, window_size):
-    if not event_windows:
-        return []
-    events = []
-    current_event = [event_windows[0], event_windows[0] + window_size]
-    for idx in event_windows[1:]:
-        if idx <= current_event[1]:
-            current_event[1] = idx + window_size
-        else:
-            events.append(current_event)
-            current_event = [idx, idx + window_size]
-    events.append(current_event)
-    return events
 
 # Основная функция
 def main():
@@ -271,31 +207,38 @@ def main():
     parser.add_argument('--plots_dir', type=str, default='plots', help='Директория для сохранения графиков')
     args = parser.parse_args()
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Используемое устройство: {device}')
+    # Проверка наличия нескольких GPU
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        gpu_count = torch.cuda.device_count()
+        print(f'Доступно GPU: {gpu_count}')
+    else:
+        device = torch.device('cpu')
+        gpu_count = 0
+        print('CUDA не доступна. Используется CPU.')
     
-    model = SeismicCNN(window_size=args.window_size).to(device)
+    model = SeismicCNN(window_size=args.window_size)
+    
+    # Если доступно несколько GPU, используем DataParallel
+    if gpu_count > 1:
+        print('Используется DataParallel для обучения на нескольких GPU.')
+        model = nn.DataParallel(model)
+    model.to(device)
     
     if args.mode == 'train':
         # Загружаем данные
         dataset, sampling_rate = load_data(args.data, args.window_size, args.minfreq, args.maxfreq, args.target_sampling_rate)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
         
-        # Получение веса классов
-        labels = []
-        for info in dataset.data_info_list:
-            labels.extend(info['labels'])
-
-        class_counts = np.bincount(labels)
-        class_weights = 1.0 / class_counts
+        # Обработка дисбаланса классов
+        all_labels = [label for _, label in dataset]
+        class_counts = np.bincount(all_labels)
+        class_weights = [len(all_labels) / class_counts[i] for i in range(len(class_counts))]
         class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
-
+        
         # Обучение модели
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-        scaler = torch.amp.GradScaler('cuda')
-
         
         model.train()
         for epoch in range(args.epochs):
@@ -304,18 +247,20 @@ def main():
                 inputs = inputs.to(device, non_blocking=True)
                 labels_batch = labels_batch.to(device, non_blocking=True)
                 optimizer.zero_grad()
-                with torch.amp.autocast('cuda'):
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels_batch)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels_batch)
+                loss.backward()
+                optimizer.step()
                 running_loss += loss.item() * inputs.size(0)
             epoch_loss = running_loss / len(dataloader.dataset)
             print(f"Эпоха [{epoch+1}/{args.epochs}], Потеря: {epoch_loss:.4f}")
         
         # Сохраняем модель
-        torch.save(model.state_dict(), args.model)
+        if gpu_count > 1:
+            # Если используется DataParallel, сохраняем модель без обертки
+            torch.save(model.module.state_dict(), args.model)
+        else:
+            torch.save(model.state_dict(), args.model)
         print(f"Модель сохранена в {args.model}")
     
     elif args.mode == 'infer':
@@ -323,19 +268,23 @@ def main():
         if not os.path.exists(args.model):
             print("Ошибка: Файл модели не найден.")
             sys.exit(1)
-        model.load_state_dict(torch.load(args.model))
+        state_dict = torch.load(args.model)
+        if gpu_count > 1:
+            model.module.load_state_dict(state_dict)
+        else:
+            model.load_state_dict(state_dict)
         model.eval()
         
         # Загружаем данные
         dataset, sampling_rate = load_data(args.data, args.window_size, args.minfreq, args.maxfreq, args.target_sampling_rate)
-        inference_loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=4)
+        inference_loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
         
         # Инференс
         event_indices = []
         model.eval()
         with torch.no_grad():
             for batch_idx, (inputs, _) in enumerate(inference_loader):
-                inputs = inputs.to(device)
+                inputs = inputs.to(device, non_blocking=True)
                 outputs = model(inputs)
                 probabilities = torch.softmax(outputs, dim=1)[:, 1]
                 predicted = (probabilities >= args.threshold).cpu().numpy()
@@ -412,25 +361,34 @@ def main():
                 axs[1].set_ylabel('Amplitude')
                 
                 # Характеристическая функция STA/LTA
-                axs[2].plot(tr_filtered.times(), cft, 'b')
-                axs[2].hlines([2.5, 0.9], tr_filtered.times()[0], tr_filtered.times()[-1], colors=['r', 'g'], linestyles='--')
+                cft_times = tr_filtered.times()[len(tr_filtered.times()) - len(cft):]
+                axs[2].plot(cft_times, cft, 'b')
+                axs[2].hlines([2.5, 0.9], cft_times[0], cft_times[-1], colors=['r', 'g'], linestyles='--')
                 axs[2].set_title('STA/LTA Characteristic Function')
                 axs[2].set_ylabel('STA/LTA Ratio')
                 
                 # Спектрограмма
-                f, t_spec, Sxx = signal.spectrogram(tr_filtered.data, tr_filtered.stats.sampling_rate, nperseg=256, noverlap=128)
-                im = axs[3].pcolormesh(t_spec, f, 10 * np.log10(Sxx), shading='gouraud', cmap='jet')
+                f, t_spec, Sxx = signal.spectrogram(
+                    tr_filtered.data,
+                    tr_filtered.stats.sampling_rate,
+                    nperseg=256,
+                    noverlap=128,
+                    scaling='spectrum',
+                    mode='psd'
+                )
+                Sxx_log = 10 * np.log10(Sxx + 1e-10)
+                im = axs[3].pcolormesh(t_spec, f, Sxx_log, shading='gouraud', cmap='jet')
                 axs[3].set_title('Spectrogram of Filtered Seismic Signal')
                 axs[3].set_xlabel('Time (s)')
                 axs[3].set_ylabel('Frequency (Hz)')
                 cbar = plt.colorbar(im, ax=axs[3], orientation='vertical')
-                cbar.set_label('Power (dB)')
+                cbar.set_label('Power/Frequency (dB/Hz)')
                 
                 # Отмечаем обнаруженные события на первом графике
                 for detection in detections:
                     if detection['filename'] == filename:
-                        event_start_time = UTCDateTime(detection['start_time'])
-                        event_end_time = UTCDateTime(detection['end_time'])
+                        event_start_time = obspy.UTCDateTime(detection['start_time'])
+                        event_end_time = obspy.UTCDateTime(detection['end_time'])
                         start = event_start_time - tr.stats.starttime
                         end = event_end_time - tr.stats.starttime
                         axs[0].axvspan(start, end, color='red', alpha=0.3)
@@ -442,6 +400,6 @@ def main():
     
     else:
         print("Неверный режим работы. Используйте 'train', 'retrain' или 'infer'.")
-    
+
 if __name__ == '__main__':
     main()
